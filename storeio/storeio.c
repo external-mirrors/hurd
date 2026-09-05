@@ -693,8 +693,6 @@ netfs_attempt_lookup (struct iouser *user, struct node *dir,
     {
       *np = dir;
       netfs_nref (*np);
-      pthread_mutex_unlock (&dir->lock);
-      pthread_mutex_lock (&(*np)->lock);
       return 0;
     }
 
