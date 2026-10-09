@@ -86,6 +86,15 @@
 #define JRNL_LOW_WATER_RATIO   8
 
 /**
+ * Background checkpoint ratios.
+ * kjournald starts checkpointing once less than 1/2 of the journal is free,
+ * and stops once 3/4 of it is free again.  The gap keeps it from running
+ * on every wake, and lets the pager write hot blocks lazily in between.
+ */
+#define JRNL_BG_START_RATIO    2
+#define JRNL_BG_STOP_RATIO     4
+
+/**
  * Slab Allocator Pool Size.
  * Pre-allocates a contiguous chunk of memory for journal buffers
  * (512 * 4KB = 2MB).
@@ -285,6 +294,10 @@ typedef struct journal
 
   int j_must_exit;		/* variable that tells journal thread when to stop. */
   pthread_cond_t j_flusher_wakeup;	/* Cond. var for the kjournald sleep cycle */
+  int j_commit_requested;	/* A stop asked kjournald to commit now. */
+
+  int j_checkpointing;		/* A flusher owns the checkpoint list. */
+  pthread_cond_t j_checkpoint_done;	/* Signalled when that flusher is done. */
 
   /* Pre-allocated buffers for zero-allocation commits */
   void *j_descriptor_buf;
@@ -1469,25 +1482,51 @@ journal_flush_intercepted_payloads (journal_t *journal,
     }
 }
 
+/* Whether a background flush should give way: the journal is shutting
+   down (quiesce owns the list), a stop asked for a commit, or a commit is
+   in flight and may be waiting for this flush.  */
+static int
+journal_checkpoint_should_yield_locked (journal_t *journal)
+{
+  return journal->j_must_exit || journal->j_commit_requested
+    || journal->j_committing_transaction;
+}
+
 /**
  * Internal helper to flush checkpoint transactions to the main filesystem.
  * If target_free is UINT32_MAX, it flushes ALL transactions in the list.
  * Otherwise, it flushes until j_free >= target_free.
+ * A BACKGROUND flush also stops between transactions when
+ * journal_checkpoint_should_yield_locked says so.
+ * Only one flusher runs at a time; a second one waits for the first, then
+ * flushes only what is still needed.
  * Returns 1 if a hardware I/O error occurred, 0 on success.
  * MUST be called with JOURNAL_LOCK held.
  */
 static int
-journal_flush_checkpoints_locked (journal_t *journal, uint32_t target_free)
+journal_flush_checkpoints_locked (journal_t *journal, uint32_t target_free,
+				  int background)
 {
   int sb_changed = 0;
   int global_io_error = 0;
 
-  while (journal->j_free < target_free && journal->j_checkpoint_list)
+  while (journal->j_checkpointing)
+    JOURNAL_WAIT (&journal->j_checkpoint_done, journal);
+  journal->j_checkpointing = 1;
+
+  while (journal->j_free < target_free && journal->j_checkpoint_list
+	 && !(background && journal_checkpoint_should_yield_locked (journal)))
     {
       diskfs_transaction_t *txn = journal->j_checkpoint_list;
       size_t iter = 0;
       journal_buffer_t *jb;
       int io_error = 0;
+
+      /* Pin TXN.  The lock is dropped for I/O and while waiting for a
+	 pager claim; a pager write that completes the last outstanding
+	 blocks would otherwise let journal_notify_blocks_written_locked
+	 advance the tail and free TXN under us.  */
+      txn->t_outstanding_io++;
 
       /* Stream the fully committed WAL shadow blocks directly to the metal */
       while ((jb = journal_map_iterate (&txn->t_buffer_map, &iter)) != NULL)
@@ -1552,6 +1591,8 @@ journal_flush_checkpoints_locked (journal_t *journal, uint32_t target_free)
 	    }
 	}
 
+      txn->t_outstanding_io--;
+
       /* All blocks are physically on disk. Reclaim the space! */
       if (!io_error)
 	{
@@ -1600,6 +1641,9 @@ journal_flush_checkpoints_locked (journal_t *journal, uint32_t target_free)
 	}
     }
 
+  journal->j_checkpointing = 0;
+  pthread_cond_broadcast (&journal->j_checkpoint_done);
+
   return global_io_error;
 }
 
@@ -1619,9 +1663,43 @@ journal_force_checkpoint_locked (journal_t *journal)
   uint32_t runway = (journal->j_last - journal->j_first) / 8;
   uint32_t target_free = journal->j_min_free + runway;
 
-  journal_flush_checkpoints_locked (journal, target_free);
+  journal_flush_checkpoints_locked (journal, target_free, 0);
 
   JRNL_LOG_DEBUG ("[CHECKPOINT] Done checkpointing (Free: %u).",
+		  journal->j_free);
+}
+
+/* Whether kjournald should checkpoint in the background: less than
+   1/JRNL_BG_START_RATIO of the journal is free and there is something to
+   flush.  */
+static int
+journal_bg_checkpoint_needed_locked (journal_t *journal)
+{
+  uint32_t capacity = journal->j_last - journal->j_first;
+
+  return journal->j_checkpoint_list && !journal->j_must_exit
+    && !diskfs_readonly
+    && journal->j_free < capacity / JRNL_BG_START_RATIO;
+}
+
+/* Checkpoint the oldest transactions until 1 - 1/JRNL_BG_STOP_RATIO of the
+   journal is free, so that commit rarely has to checkpoint itself.  Gives
+   way to commits and to shutdown between transactions.  Called by
+   kjournald.  */
+static void
+journal_bg_checkpoint_locked (journal_t *journal)
+{
+  uint32_t capacity = journal->j_last - journal->j_first;
+
+  if (!journal_bg_checkpoint_needed_locked (journal))
+    return;
+
+  JRNL_LOG_DEBUG ("[CHECKPOINT] Background checkpoint (Free: %u).",
+		  journal->j_free);
+  journal_flush_checkpoints_locked (journal,
+				    capacity - capacity / JRNL_BG_STOP_RATIO,
+				    1);
+  JRNL_LOG_DEBUG ("[CHECKPOINT] Background checkpoint done (Free: %u).",
 		  journal->j_free);
 }
 
@@ -2287,6 +2365,10 @@ journal_commit_running_transaction_locked (journal_t *journal)
 
   /* Wake up everyone waiting in journal_wait_on_tid */
   pthread_cond_broadcast (&journal->j_commit_done);
+  /* Start a background checkpoint now rather than at the next tick.  When
+     kjournald is the committer it checks for itself after the commit.  */
+  if (journal_bg_checkpoint_needed_locked (journal))
+    pthread_cond_signal (&journal->j_flusher_wakeup);
   JOURNAL_UNLOCK (journal);
   if (need_sb_flush)
     flush_to_disk ();
@@ -2326,6 +2408,14 @@ out:
  * that when the Mach VM Pager eventually needs to flush dirty pages to the
  * main disk, it doesn't stall the system waiting for synchronous journal I/O.
  *
+ * - Background Checkpointing: After each wake it checkpoints the oldest
+ * committed transactions once the journal is more than half full (see
+ * journal_bg_checkpoint_locked), so that commit rarely has to stall on a
+ * forced checkpoint.  A pass gives way to a requested commit.
+ *
+ * It commits on the 5-second tick and when a stop requests it
+ * (j_commit_requested).  A wake only for checkpointing does not commit.
+ *
  * Future work: The interval could be made dynamic based on VFS load, but
  * a static 5-second interval provides a solid baseline.
  */
@@ -2338,18 +2428,28 @@ kjournald_thread (void *arg)
   JOURNAL_LOCK (journal);
   while (!journal->j_must_exit)
     {
-      clock_gettime (CLOCK_MONOTONIC, &ts);
-      ts.tv_sec += 5;
+      int commit = journal->j_commit_requested;
 
-      pthread_cond_clockwait (&journal->j_flusher_wakeup,
-			      &journal->j_state_lock, CLOCK_MONOTONIC, &ts);
+      /* A request made while we were busy is not waited for: its signal
+	 has already gone.  */
+      if (!commit)
+	{
+	  clock_gettime (CLOCK_MONOTONIC, &ts);
+	  ts.tv_sec += 5;
+
+	  int err = pthread_cond_clockwait (&journal->j_flusher_wakeup,
+					    &journal->j_state_lock,
+					    CLOCK_MONOTONIC, &ts);
+	  commit = err == ETIMEDOUT || journal->j_commit_requested;
+	}
+      journal->j_commit_requested = 0;
 
       if (journal->j_must_exit)
 	break;
       if (diskfs_readonly)
 	continue;
 
-      if (journal->j_running_transaction)
+      if (commit && journal->j_running_transaction)
 	{
 	  JRNL_LOG_DEBUG ("Woke the journal up:\n"
 			  " - Sequence: %u\n"
@@ -2363,6 +2463,8 @@ kjournald_thread (void *arg)
 	  if (err)
 	    JRNL_LOG_WARN ("Background commit failed: %s", strerror (err));
 	}
+
+      journal_bg_checkpoint_locked (journal);
     }
   JOURNAL_UNLOCK (journal);
   return NULL;
@@ -2403,6 +2505,7 @@ journal_create (struct node *journal_inode)
   pthread_mutex_init (&j->j_state_lock, NULL);
   pthread_cond_init (&j->j_commit_wait, NULL);
   pthread_cond_init (&j->j_flusher_wakeup, NULL);
+  pthread_cond_init (&j->j_checkpoint_done, NULL);
   pthread_cond_init (&j->j_flush_wait, NULL);
   pthread_cond_init (&j->j_running_wait, NULL);
 
@@ -2490,7 +2593,8 @@ journal_quiesce_checkpoints (void)
 
   /* Write ALL shadow data from every checkpoint transaction to the main disk. */
   /* Pass UINT32_MAX to guarantee we drain the entire checkpoint list */
-  int io_error = journal_flush_checkpoints_locked (ext2_journal, UINT32_MAX);
+  int io_error =
+    journal_flush_checkpoints_locked (ext2_journal, UINT32_MAX, 0);
 
   if (io_error)
     {
@@ -2515,7 +2619,10 @@ diskfs_journal_stop_transaction_locked (journal_t *journal,
   /* Semi auto-commit? */
   if (txn->t_active_threads == 0 && (txn->sync_needed ||
       (txn->t_buffer_map.size >= journal->j_max_transaction_buffers)))
-    pthread_cond_signal (&journal->j_flusher_wakeup);
+    {
+      journal->j_commit_requested = 1;
+      pthread_cond_signal (&journal->j_flusher_wakeup);
+    }
 }
 
 /* Ends the caller's participation in the given transaction TXN.
