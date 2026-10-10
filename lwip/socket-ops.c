@@ -370,8 +370,11 @@ lwip_S_socket_send (struct sock_user * user,
     return EINVAL;
 
   sockflags = lwip_fcntl (user->sock->sockno, F_GETFL, 0);
-  /* XXX: missing !MSG_NOSIGNAL support, i.e. generate SIGPIPE */
+
+  /* In the Hurd, servers are not responsible for SIGPIPE; the library
+     does that itself upon receiving EPIPE.  */
   flags &= ~MSG_NOSIGNAL;
+
   if (sockflags & O_NONBLOCK)
     flags |= MSG_DONTWAIT;
 
