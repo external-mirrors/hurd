@@ -111,13 +111,14 @@ trunc_direct (struct node *node, block_t end, struct free_block_run *fbr)
 
 /* Free any blocks in NODE greater than or equal to END that are rooted in
    the indirect block *P; OFFSET should be the block position that *P
-   corresponds to.  For each block pointer in *P that should be freed,
-   FREE_BLOCK is called with a pointer to the entry for that block, and the
-   index of the entry within *P.  If every block in *P is freed, then *P is
-   set to 0, otherwise it is left alone.  */
+   corresponds to, and SPAN the number of file blocks each entry of *P
+   covers (1 for a single indirect block).  For each block pointer in *P
+   that should be freed, FREE_BLOCK is called with a pointer to the entry
+   for that block, and the index of the entry within *P.  If every block in
+   *P is freed, then *P is set to 0, otherwise it is left alone.  */
 static void
 trunc_indirect (struct node *node, block_t end,
-		block_t *p, block_t offset,
+		block_t *p, block_t offset, block_t span,
 		void (*free_block)(block_t *p, unsigned index),
 		struct free_block_run *fbr)
 {
@@ -128,7 +129,9 @@ trunc_indirect (struct node *node, block_t end,
       unsigned index;
       int modified = 0, all_freed = 1;
       block_t *ind_bh = (block_t *) disk_cache_block_ref (*p);
-      unsigned first = end < offset ? 0 : end - offset;
+      /* The entry that holds END: it is truncated in part, and the ones
+	 after it are freed.  */
+      unsigned first = end < offset ? 0 : (end - offset) / span;
 
       for (index = first; index < addr_per_block; index++)
 	if (ind_bh[index])
@@ -177,7 +180,7 @@ trunc_single_indirect (struct node *node, block_t end,
     {
       free_block_run_free_ptr (fbr, p);
     }
-  trunc_indirect (node, end, p, offset, free_block, fbr);
+  trunc_indirect (node, end, p, offset, 1, free_block, fbr);
 }
 
 static void
@@ -190,7 +193,7 @@ trunc_double_indirect (struct node *node, block_t end,
       block_t entry_offs = offset + (index * addr_per_block);
       trunc_single_indirect (node, end, p, entry_offs, fbr);
     }
-  trunc_indirect (node, end, p, offset, free_block, fbr);
+  trunc_indirect (node, end, p, offset, addr_per_block, free_block, fbr);
 }
 
 static void
@@ -203,7 +206,8 @@ trunc_triple_indirect (struct node *node, block_t end,
       block_t entry_offs = offset + (index * addr_per_block * addr_per_block);
       trunc_double_indirect (node, end, p, entry_offs, fbr);
     }
-  trunc_indirect (node, end, p, offset, free_block, fbr);
+  trunc_indirect (node, end, p, offset, addr_per_block * addr_per_block,
+		  free_block, fbr);
 }
 
 /* ---------------------------------------------------------------- */
